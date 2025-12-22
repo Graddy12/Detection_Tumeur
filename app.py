@@ -62,46 +62,56 @@ def preparer_image(image_pil, taille=TAILLE_IMAGE):
 # FONCTIONS GRAD-CAM
 
 def creer_gradcam(model, img_array, layer_name, pred_index=None):
-    """
-    Génère la carte d'activation Grad-CAM pour visualiser les régions importantes.
-    
-    Args:
-        model: Modèle Keras
-        img_array: Image d'entrée sous forme de tableau numpy
-        layer_name: Nom de la couche convolutive à utiliser
-        pred_index: Index de la classe à expliquer (None = classe prédite)
-    
-    Returns:
-        tuple: (heatmap, predictions) ou (None, None) en cas d'erreur
-    """
     try:
-        grad_model = keras.models.Model(
-            [model.inputs], 
-            [model.get_layer(layer_name).output, model.output]
+        # Vérification de la couche
+        layer = model.get_layer(layer_name)
+        if len(layer.output.shape) != 4:
+            st.error(
+                f"La couche '{layer_name}' n'est pas une couche convolutionnelle valide "
+                f"(shape = {layer.output.shape})"
+            )
+            return None, None
+
+        grad_model = tf.keras.models.Model(
+            inputs=model.inputs,
+            outputs=[layer.output, model.output]
         )
-        
+
         with tf.GradientTape() as tape:
             conv_outputs, predictions = grad_model(img_array)
-            
+
             if pred_index is None:
                 pred_index = tf.argmax(predictions[0])
-            
-            class_channel = predictions[:, pred_index]
-        
-        grads = tape.gradient(class_channel, conv_outputs)
+
+            loss = predictions[:, pred_index]
+
+        grads = tape.gradient(loss, conv_outputs)
+
+        if grads is None:
+            st.error("Impossible de calculer les gradients (grads=None)")
+            return None, None
+
+        # Moyenne spatiale des gradients
         pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        
+
         conv_outputs = conv_outputs[0]
-        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-        heatmap = tf.squeeze(heatmap)
-        
-        heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
-        
+        pooled_grads = pooled_grads.numpy()
+
+        # Pondération des cartes d’activation
+        for i in range(pooled_grads.shape[-1]):
+            conv_outputs[:, :, i] *= pooled_grads[i]
+
+        heatmap = tf.reduce_mean(conv_outputs, axis=-1)
+
+        heatmap = tf.maximum(heatmap, 0)
+        heatmap /= tf.reduce_max(heatmap) + 1e-8
+
         return heatmap.numpy(), predictions.numpy()
-    
+
     except Exception as e:
         st.error(f"Erreur lors de la génération Grad-CAM : {str(e)}")
         return None, None
+
 
 def superposer_gradcam(img_array, heatmap, alpha=0.4):
     """
