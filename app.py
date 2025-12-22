@@ -209,6 +209,9 @@ def main():
     """
     Fonction principale de l'application.
     """
+    # Déclarer que nous allons utiliser la variable globale
+    global NOM_DERNIERE_COUCHE_CONV
+    
     # Configuration
     st.set_page_config(
         page_title="Analyse d'IRM Cérébrales",
@@ -274,17 +277,18 @@ def main():
                         # Afficher résultats
                         st.success(f"**Résultat: {predicted_class.capitalize()}** (confiance: {confidence:.1f}%)")
                         
-                        # Générer Grad-CAM
+                        # Générer Grad-CAM - utiliser une variable locale
+                        layer_name_to_use = NOM_DERNIERE_COUCHE_CONV
                         heatmap, _ = make_gradcam_heatmap(
                             model, 
                             img_array, 
-                            NOM_DERNIERE_COUCHE_CONV,
+                            layer_name_to_use,
                             pred_index
                         )
                         
                         # Fallback si la couche spécifiée ne fonctionne pas
                         if heatmap is None:
-                            st.warning(f"La couche '{NOM_DERNIERE_COUCHE_CONV}' ne fonctionne pas. Recherche d'une couche alternative...")
+                            st.warning(f"La couche '{layer_name_to_use}' ne fonctionne pas. Recherche d'une couche alternative...")
                             
                             # Essayer avec différentes couches
                             alternative_layers = []
@@ -293,14 +297,14 @@ def main():
                                     alternative_layers.append(layer.name)
                             
                             if alternative_layers:
-                                for layer_name in alternative_layers[:3]:  # Essayer 3 premières
-                                    st.write(f"Essai avec la couche: {layer_name}")
+                                for alternative_layer in alternative_layers[:3]:  # Essayer 3 premières
+                                    st.write(f"Essai avec la couche: {alternative_layer}")
                                     heatmap, _ = make_gradcam_heatmap(
-                                        model, img_array, layer_name, pred_index
+                                        model, img_array, alternative_layer, pred_index
                                     )
                                     if heatmap is not None:
-                                        NOM_DERNIERE_COUCHE_CONV = layer_name
-                                        st.info(f"Utilisation de la couche: {layer_name}")
+                                        layer_name_to_use = alternative_layer
+                                        st.info(f"Utilisation de la couche: {layer_name_to_use}")
                                         break
                         
                         if heatmap is not None:
@@ -317,7 +321,7 @@ def main():
                             # Afficher le résultat
                             st.image(
                                 superimposed_img,
-                                caption=f"Visualisation Grad-CAM - {predicted_class}",
+                                caption=f"Visualisation Grad-CAM - {predicted_class} (couche: {layer_name_to_use})",
                                 use_container_width=True
                             )
                             
@@ -345,7 +349,7 @@ def main():
             st.code(traceback.format_exc())
     
     else:
-        st.info(" Veuillez télécharger une image IRM pour commencer l'analyse")
+        st.info("👆 Veuillez télécharger une image IRM pour commencer l'analyse")
         
         # Section exemple
         with st.expander("Comment utiliser cette application"):
