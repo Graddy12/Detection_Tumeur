@@ -14,11 +14,10 @@ from PIL import Image
 import os
 
 # CONFIGURATION DES CONSTANTES
-
 TAILLE_IMAGE = (224, 224)
-NOM_DERNIERE_COUCHE_CONV = "TumeurD2"
+NOM_DERNIERE_COUCHE_CONV = "TumeurD2"  # Vérifiez ce nom dans votre modèle
 NOMS_CLASSES = ['glioma', 'meningioma', 'notumor', 'pituitary']
-CHEMIN_MODELE = "modele/modele.h5"
+CHEMIN_MODELE = "modele.h5"  # Changez ce chemin si nécessaire
 
 # FONCTIONS DE CHARGEMENT ET PRÉTRAITEMENT
 
@@ -26,18 +25,31 @@ CHEMIN_MODELE = "modele/modele.h5"
 def charger_modele():
     """
     Charge le modèle Keras pré-entraîné depuis le disque.
-    
-    Returns:
-        model: Modèle Keras chargé
     """
     try:
-        if not os.path.exists(CHEMIN_MODELE):
-            st.error(f"Fichier modèle introuvable : {CHEMIN_MODELE}")
-            st.info("Veuillez placer le modèle dans le répertoire 'modele/'")
+        # Essayer plusieurs chemins possibles
+        chemins_possibles = [
+            CHEMIN_MODELE,
+            "modele.h5",
+            "model.h5",
+            "modele/modele.h5",
+            "/mount/src/your-repo-name/modele.h5"  # Chemin sur Streamlit Cloud
+        ]
+        
+        chemin_trouve = None
+        for chemin in chemins_possibles:
+            if os.path.exists(chemin):
+                chemin_trouve = chemin
+                break
+        
+        if not chemin_trouve:
+            st.error("Fichier modèle introuvable. Chemins essayés:")
+            for chemin in chemins_possibles:
+                st.write(f"- {chemin}")
             st.stop()
         
-        modele = keras.models.load_model(CHEMIN_MODELE)
-        st.sidebar.success("Modèle chargé avec succès")
+        modele = keras.models.load_model(chemin_trouve, compile=False)
+        st.sidebar.success(f"Modèle chargé: {chemin_trouve}")
         return modele
     except Exception as e:
         st.error(f"Erreur lors du chargement du modèle : {str(e)}")
@@ -45,218 +57,197 @@ def charger_modele():
 
 def preparer_image(image_pil, taille=TAILLE_IMAGE):
     """
-    Prétraite l'image pour la classification par le modèle.
-    
-    Args:
-        image_pil: Image PIL à prétraiter
-        taille: Dimensions cibles de l'image
-    
-    Returns:
-        numpy.ndarray: Image prétraitée sous forme de tableau numpy
+    Prétraite l'image pour la classification.
     """
     image = image_pil.resize(taille)
     image_array = keras.utils.img_to_array(image)
     image_array = np.expand_dims(image_array, axis=0)
+    image_array = image_array / 255.0
     return image_array
 
-# FONCTIONS GRAD-CAM
+# FONCTIONS GRAD-CAM - CORRIGÉES
 
-def creer_gradcam(model, img_array, layer_name, pred_index=None):
+def make_gradcam_heatmap(model, img_array, layer_name, pred_index=None):
+    """
+    Version simplifiée et corrigée de Grad-CAM.
+    Évite les erreurs d'indexation par tuple.
+    """
     try:
-        # Vérification de la couche
-        layer = model.get_layer(layer_name)
-        if len(layer.output.shape) != 4:
-            st.error(
-                f"La couche '{layer_name}' n'est pas une couche convolutionnelle valide "
-                f"(shape = {layer.output.shape})"
-            )
-            return None, None
-
+        # Créer un modèle qui retourne les activations de la couche et les prédictions
         grad_model = tf.keras.models.Model(
-            inputs=model.inputs,
-            outputs=[layer.output, model.output]
+            [model.inputs], 
+            [model.get_layer(layer_name).output, model.output]
         )
-
+        
+        # Enregistrer les opérations sous la bande de gradient
         with tf.GradientTape() as tape:
             conv_outputs, predictions = grad_model(img_array)
-
+            
             if pred_index is None:
                 pred_index = tf.argmax(predictions[0])
-
-            loss = predictions[:, pred_index]
-
-        grads = tape.gradient(loss, conv_outputs)
-
+            
+            # Extraire la prédiction pour la classe cible
+            # CORRECTION: Utiliser [0, pred_index] au lieu de [:, pred_index]
+            class_channel = predictions[0, pred_index]
+        
+        # Extraire les gradients
+        grads = tape.gradient(class_channel, conv_outputs)
+        
+        # CORRECTION: Vérifier que grads n'est pas None
         if grads is None:
-            st.error("Impossible de calculer les gradients (grads=None)")
-            return None, None
-
-        # Moyenne spatiale des gradients
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
-        conv_outputs = conv_outputs[0]
-        pooled_grads = pooled_grads.numpy()
-
-        # Pondération des cartes d’activation
-        for i in range(pooled_grads.shape[-1]):
-            conv_outputs[:, :, i] *= pooled_grads[i]
-
-        heatmap = tf.reduce_mean(conv_outputs, axis=-1)
-
+            # Fallback: utiliser les activations moyennes
+            heatmap = tf.reduce_mean(conv_outputs[0], axis=-1)
+            return heatmap.numpy(), predictions.numpy()
+        
+        # Pooling des gradients sur les axes spatiaux
+        # CORRECTION: Utiliser axis=[0, 1, 2] au lieu de axis=(0, 1, 2)
+        pooled_grads = tf.reduce_mean(grads, axis=[0, 1, 2])
+        
+        # Multiplier chaque canal par le gradient moyen correspondant
+        conv_outputs = conv_outputs[0]  # Shape: (height, width, channels)
+        
+        # CORRECTION: Éviter l'opérateur @ qui peut causer des problèmes
+        heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
+        
+        # ReLU et normalisation
         heatmap = tf.maximum(heatmap, 0)
-        heatmap /= tf.reduce_max(heatmap) + 1e-8
-
+        max_val = tf.reduce_max(heatmap)
+        
+        if max_val > 0:
+            heatmap = heatmap / max_val
+        else:
+            # Si tout est zéro, créer une heatmap uniforme
+            heatmap = tf.zeros_like(heatmap)
+        
         return heatmap.numpy(), predictions.numpy()
-
+    
     except Exception as e:
-        st.error(f"Erreur lors de la génération Grad-CAM : {str(e)}")
+        st.error(f"Erreur Grad-CAM détaillée: {str(e)}")
+        
+        # Debug: Afficher des informations supplémentaires
+        try:
+            st.write("Debug - Informations sur le modèle:")
+            st.write(f"Nombre de couches: {len(model.layers)}")
+            st.write(f"Couches disponibles (5 dernières):")
+            for layer in model.layers[-5:]:
+                st.write(f"  - {layer.name} ({layer.__class__.__name__})")
+        except:
+            pass
+        
         return None, None
-
 
 def superposer_gradcam(img_array, heatmap, alpha=0.4):
     """
-    Superpose la carte Grad-CAM sur l'image originale.
-    
-    Args:
-        img_array: Image originale sous forme de tableau numpy
-        heatmap: Carte de chaleur Grad-CAM
-        alpha: Transparence de la superposition
-    
-    Returns:
-        PIL.Image: Image avec superposition Grad-CAM
+    Superpose la carte Grad-CAM sur l'image.
     """
-    heatmap = cv2.resize(heatmap, (img_array.shape[1], img_array.shape[0]))
-    heatmap = np.uint8(255 * heatmap)
-    
-    colormap = mpl.colormaps["jet"]
-    colors = colormap(np.arange(256))[:, :3]
-    colored_heatmap = colors[heatmap]
-    
-    colored_heatmap = keras.utils.array_to_img(colored_heatmap)
-    colored_heatmap = keras.utils.img_to_array(colored_heatmap)
-    
-    superimposed_img = colored_heatmap * alpha + img_array
-    superimposed_img = keras.utils.array_to_img(superimposed_img)
-    
-    return superimposed_img
+    try:
+        if heatmap is None:
+            return Image.fromarray(img_array.astype(np.uint8))
+        
+        # Redimensionner la heatmap
+        heatmap_resized = cv2.resize(heatmap, (img_array.shape[1], img_array.shape[0]))
+        
+        # Normaliser entre 0 et 1
+        if heatmap_resized.max() > 0:
+            heatmap_resized = heatmap_resized / heatmap_resized.max()
+        
+        # Appliquer la colormap
+        colormap = mpl.colormaps["jet"]
+        heatmap_colored = colormap(heatmap_resized)[:, :, :3]  # Ignorer alpha
+        
+        # Convertir en 0-255
+        heatmap_colored = (heatmap_colored * 255).astype(np.uint8)
+        
+        # Superposer
+        superimposed = heatmap_colored * alpha + img_array * (1 - alpha)
+        superimposed = np.clip(superimposed, 0, 255).astype(np.uint8)
+        
+        return Image.fromarray(superimposed)
+    except Exception as e:
+        st.error(f"Erreur superposition: {str(e)}")
+        return Image.fromarray(img_array.astype(np.uint8))
 
-# FONCTIONS D'AFFICHAGE ET D'INTERFACE
+# FONCTIONS D'AFFICHAGE
 
 def afficher_predictions_detailees(predictions):
     """
-    Affiche les probabilités de prédiction sous forme de barres de progression.
-    
-    Args:
-        predictions: Tableau de probabilités pour chaque classe
+    Affiche les probabilités de prédiction.
     """
-    st.subheader("Probabilités détaillées par classe")
+    st.subheader("Probabilités détaillées")
     
     cols = st.columns(4)
     for i, classe in enumerate(NOMS_CLASSES):
         proba = predictions[i] * 100
         with cols[i]:
-            # Détermination de la couleur en fonction du seuil
-            if proba > 70:
-                color = "green"
-            elif proba > 30:
-                color = "orange"
-            else:
-                color = "gray"
-            
-            st.markdown(f"<h4>{classe.capitalize()}</h4>", unsafe_allow_html=True)
-            st.progress(
-                min(int(proba), 100) / 100,
-                text=f"{proba:.1f}%"
-            )
+            st.markdown(f"**{classe.capitalize()}**")
+            st.progress(float(proba/100), text=f"{proba:.1f}%")
 
-def afficher_informations_modele():
+def debug_model_layers(model):
     """
-    Affiche les informations techniques du modèle dans la sidebar.
+    Fonction de debug pour afficher les couches du modèle.
     """
-    with st.sidebar.expander("Informations techniques"):
-        st.write(f"**Couche Grad-CAM:** {NOM_DERNIERE_COUCHE_CONV}")
-        st.write(f"**Taille d'entrée:** {TAILLE_IMAGE}")
-        st.write(f"**Architecture:** CNN avec couches convolutives")
-        st.write(f"**Classes:** {', '.join(NOMS_CLASSES)}")
-
-def afficher_guide_utilisation():
-    """
-    Affiche le guide d'utilisation dans la sidebar.
-    """
-    with st.sidebar.expander("Guide d'utilisation"):
-        st.markdown("""
-        **Procédure:**
-        1. Téléchargez une image IRM cérébrale
-        2. Cliquez sur 'Analyser avec Grad-CAM'
-        3. Visualisez la prédiction et les explications
+    with st.sidebar.expander("Debug - Couches du modèle"):
+        st.write(f"Total couches: {len(model.layers)}")
+        st.write("Noms des couches (recherche de couches convolutionnelles):")
         
-        **Classes diagnostiques:**
-        - **Glioma**: Tumeur du tissu glial cérébral
-        - **Meningioma**: Tumeur des méninges
-        - **Notumor**: Absence de tumeur détectée
-        - **Pituitary**: Tumeur de l'hypophyse
+        conv_layers = []
+        for i, layer in enumerate(model.layers):
+            layer_type = layer.__class__.__name__
+            if 'conv' in layer_type.lower() or 'Conv' in layer.name:
+                conv_layers.append((i, layer.name, layer_type))
         
-        **Format supporté:** JPG, JPEG, PNG
-        """)
+        if conv_layers:
+            st.write("Couches convolutionnelles trouvées:")
+            for i, name, ltype in conv_layers:
+                st.write(f"  {i}: {name} ({ltype})")
+        else:
+            st.write("Aucune couche convolutionnelle trouvée avec 'conv' dans le nom")
 
 # APPLICATION PRINCIPALE
 
 def main():
     """
-    Fonction principale de l'application Streamlit.
+    Fonction principale de l'application.
     """
-    # Configuration de la page
+    # Configuration
     st.set_page_config(
-        page_title="Système d'Analyse d'IRM Cérébrales",
+        page_title="Analyse d'IRM Cérébrales",
         page_icon="🧠",
-        layout="wide",
-        initial_sidebar_state="expanded"
+        layout="wide"
     )
     
-    # En-tête de l'application
-    st.title("Système d'Analyse d'IRM Cérébrales")
-    st.markdown("""
-    Application d'aide au diagnostic par intelligence artificielle.
-    Classification automatique des images IRM avec explication des prédictions.
-    """)
+    st.title("🧠 Système d'Analyse d'IRM Cérébrales")
+    st.markdown("Classification automatique avec explication visuelle par Grad-CAM")
     
-    st.divider()
+    # Sidebar
+    st.sidebar.header("Paramètres")
     
-    # Sidebar - Paramètres
-    st.sidebar.header("Paramètres d'analyse")
+    # Option pour choisir la couche manuellement
+    st.sidebar.subheader("Configuration Grad-CAM")
     
-    # Paramètre de transparence Grad-CAM
-    alpha = st.sidebar.slider(
-        "Intensité de visualisation Grad-CAM",
-        min_value=0.1,
-        max_value=0.8,
-        value=0.4,
-        step=0.1,
-        help="Contrôle la visibilité de la superposition"
-    )
-    
-    # Chargement du modèle
-    st.sidebar.subheader("Modèle")
+    # Charger le modèle d'abord
     model = charger_modele()
     
-    # Informations techniques
-    afficher_informations_modele()
+    # Debug optionnel
+    if st.sidebar.checkbox("Activer le mode debug"):
+        debug_model_layers(model)
     
-    # Guide d'utilisation
-    afficher_guide_utilisation()
+    # Paramètres
+    alpha = st.sidebar.slider(
+        "Transparence Grad-CAM", 0.1, 0.8, 0.4, 0.1
+    )
     
-    # Section principale - Téléchargement d'image
-    st.header("Analyse d'image IRM")
+    # Téléchargement d'image
+    st.header("Téléchargement d'image")
     
     uploaded_file = st.file_uploader(
-        "Sélectionnez une image IRM cérébrale",
-        type=["jpg", "jpeg", "png"],
-        help="Formats supportés: JPG, JPEG, PNG"
+        "Choisissez une image IRM",
+        type=["jpg", "jpeg", "png"]
     )
     
     if uploaded_file is not None:
-        # Affichage de l'image originale
         try:
+            # Ouvrir l'image
             image = Image.open(uploaded_file).convert("RGB")
             original_image = image.copy()
             
@@ -266,90 +257,110 @@ def main():
                 st.subheader("Image originale")
                 st.image(image, use_container_width=True)
             
-            # Bouton d'analyse
-            if st.button("Lancer l'analyse Grad-CAM", type="primary"):
-                with st.spinner("Analyse en cours..."):
-                    # Préparation de l'image
-                    img_array = preparer_image(image)
-                    
-                    # Prédiction
-                    predictions = model.predict(img_array, verbose=0)[0]
-                    pred_index = np.argmax(predictions)
-                    predicted_class = NOMS_CLASSES[pred_index]
-                    confidence = predictions[pred_index] * 100
-                    
-                    # Affichage des résultats
-                    st.success(f"Diagnostic prédit : **{predicted_class.capitalize()}**")
-                    
-                    col_metric1, col_metric2 = st.columns(2)
-                    with col_metric1:
-                        st.metric("Confiance", f"{confidence:.1f}%")
-                    with col_metric2:
-                        st.metric("Classe", predicted_class.capitalize())
-                    
-                    # Génération Grad-CAM
-                    heatmap, _ = creer_gradcam(
-                        model, 
-                        img_array, 
-                        NOM_DERNIERE_COUCHE_CONV,
-                        pred_index
-                    )
-                    
-                    if heatmap is not None:
-                        # Préparation pour superposition
-                        img_for_overlay = keras.utils.img_to_array(
-                            original_image.resize(TAILLE_IMAGE)
-                        ).astype(np.uint8)
+            with col2:
+                st.subheader("Zone d'analyse")
+                
+                if st.button("🔍 Lancer l'analyse", type="primary", use_container_width=True):
+                    with st.spinner("Analyse en cours..."):
+                        # Préparer l'image
+                        img_array = preparer_image(image)
                         
-                        # Superposition Grad-CAM
-                        superimposed_img = superposer_gradcam(
-                            img_for_overlay, 
-                            heatmap, 
-                            alpha
+                        # Prédiction
+                        predictions = model.predict(img_array, verbose=0)[0]
+                        pred_index = np.argmax(predictions)
+                        predicted_class = NOMS_CLASSES[pred_index]
+                        confidence = predictions[pred_index] * 100
+                        
+                        # Afficher résultats
+                        st.success(f"**Résultat: {predicted_class.capitalize()}** (confiance: {confidence:.1f}%)")
+                        
+                        # Générer Grad-CAM
+                        heatmap, _ = make_gradcam_heatmap(
+                            model, 
+                            img_array, 
+                            NOM_DERNIERE_COUCHE_CONV,
+                            pred_index
                         )
                         
-                        # Affichage Grad-CAM
-                        with col2:
-                            st.subheader("Visualisation Grad-CAM")
+                        # Fallback si la couche spécifiée ne fonctionne pas
+                        if heatmap is None:
+                            st.warning(f"La couche '{NOM_DERNIERE_COUCHE_CONV}' ne fonctionne pas. Recherche d'une couche alternative...")
+                            
+                            # Essayer avec différentes couches
+                            alternative_layers = []
+                            for layer in model.layers:
+                                if 'conv' in layer.name.lower() or 'activation' in layer.name:
+                                    alternative_layers.append(layer.name)
+                            
+                            if alternative_layers:
+                                for layer_name in alternative_layers[:3]:  # Essayer 3 premières
+                                    st.write(f"Essai avec la couche: {layer_name}")
+                                    heatmap, _ = make_gradcam_heatmap(
+                                        model, img_array, layer_name, pred_index
+                                    )
+                                    if heatmap is not None:
+                                        NOM_DERNIERE_COUCHE_CONV = layer_name
+                                        st.info(f"Utilisation de la couche: {layer_name}")
+                                        break
+                        
+                        if heatmap is not None:
+                            # Préparer l'image pour superposition
+                            img_for_overlay = np.array(original_image.resize(TAILLE_IMAGE))
+                            
+                            # Superposer Grad-CAM
+                            superimposed_img = superposer_gradcam(
+                                img_for_overlay, 
+                                heatmap, 
+                                alpha
+                            )
+                            
+                            # Afficher le résultat
                             st.image(
-                                superimposed_img, 
-                                caption=f"Régions déterminantes pour '{predicted_class}'",
+                                superimposed_img,
+                                caption=f"Visualisation Grad-CAM - {predicted_class}",
                                 use_container_width=True
                             )
-                        
-                        # Détails des prédictions
-                        afficher_predictions_detailees(predictions)
-                        
-                        # Explication technique
-                        with st.expander("Interprétation de la visualisation Grad-CAM"):
-                            st.markdown("""
-                            **Légende des couleurs:**
                             
-                            - **Zones rouges/jaunes**: Régions les plus influentes dans la décision du modèle
-                            - **Zones bleues**: Régions moins pertinentes pour la classification
+                            # Détails des prédictions
+                            afficher_predictions_detailees(predictions)
                             
-                            **Méthodologie:**
-                            La technique Grad-CAM (Gradient-weighted Class Activation Mapping) 
-                            utilise les gradients de la classe prédite par rapport aux caractéristiques 
-                            de la dernière couche convolutive pour identifier les régions importantes.
-                            
-                            **Note importante:**
-                            Cette application constitue un outil d'aide au diagnostic et ne remplace pas 
-                            l'expertise d'un professionnel de santé qualifié.
-                            """)
-                    
-                    else:
-                        st.warning("La génération de l'explication visuelle a échoué.")
+                            # Explications
+                            with st.expander("ℹ️ Interprétation"):
+                                st.markdown("""
+                                **Grad-CAM (Gradient-weighted Class Activation Mapping):**
+                                - Zones **rouges/jaunes**: Régions déterminantes pour la décision
+                                - Zones **bleues**: Régions moins importantes
+                                
+                                **Note médicale:** Cet outil est une aide au diagnostic.
+                                Consultez toujours un professionnel de santé.
+                                """)
+                        else:
+                            st.error("Impossible de générer la visualisation Grad-CAM.")
+                            st.info("Affichage des prédictions uniquement:")
+                            afficher_predictions_detailees(predictions)
         
         except Exception as e:
-            st.error(f"Erreur lors du traitement de l'image : {str(e)}")
+            st.error(f"Erreur de traitement: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
+    
+    else:
+        st.info(" Veuillez télécharger une image IRM pour commencer l'analyse")
+        
+        # Section exemple
+        with st.expander("Comment utiliser cette application"):
+            st.markdown("""
+            1. **Téléchargez** une image IRM cérébrale
+            2. **Cliquez** sur "Lancer l'analyse"
+            3. **Visualisez** le diagnostic et les explications
+            
+            **Formats acceptés:** JPG, JPEG, PNG
+            **Résolution recommandée:** 224x224 pixels
+            """)
     
     # Pied de page
     st.divider()
-    st.caption("Application développée à des fins de recherche médicale - Outil d'aide au diagnostic")
-    st.caption("Les résultats doivent être validés par un radiologue qualifié")
-
-# POINT D'ENTRÉE
+    st.caption("Application d'aide au diagnostic - À utiliser avec l'expertise médicale appropriée")
 
 if __name__ == "__main__":
     main()
