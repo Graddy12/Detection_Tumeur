@@ -1,0 +1,9 @@
+# requirements.txt
+streamlit
+tensorflow
+numpy
+opencv-python-headless
+matplotlib
+Pillow
+
+
