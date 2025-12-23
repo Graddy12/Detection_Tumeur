@@ -1,5 +1,5 @@
 """
-Application de classification d'IRM cérébrales avec explication par Grad-CAM
+Application de classification d'IRM cérébrales
 Application professionnelle pour l'analyse assistée d'images médicales
 """
 
@@ -7,16 +7,18 @@ import streamlit as st
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
-import matplotlib.pyplot as plt
-import matplotlib as mpl
-import cv2
 from PIL import Image
 import os
 
 # CONFIGURATION DES CONSTANTES
 TAILLE_IMAGE = (224, 224)
-NOM_DERNIERE_COUCHE_CONV = "TumeurD2"
-NOMS_CLASSES = ['glioma', 'meningioma', 'notumor', 'pituitary']
+NOMS_CLASSES = ['Glioma', 'Méningiome', 'Pas de tumeur', 'Hypophyse']
+DESCRIPTIONS_CLASSES = {
+    'Glioma': 'Tumeur se développant dans le tissu glial du cerveau',
+    'Méningiome': 'Tumeur se développant dans les méninges',
+    'Pas de tumeur': 'Aucune tumeur détectée sur l\'image',
+    'Hypophyse': 'Tumeur de la glande hypophysaire'
+}
 CHEMIN_MODELE = "modele.h5"
 
 # FONCTIONS DE CHARGEMENT ET PRÉTRAITEMENT
@@ -24,7 +26,7 @@ CHEMIN_MODELE = "modele.h5"
 @st.cache_resource
 def charger_modele():
     """
-    Charge le modèle Keras pré-entraîné depuis le disque.
+    Charge le modèle Keras pré-entraîné.
     """
     try:
         # Essayer plusieurs chemins possibles
@@ -43,13 +45,11 @@ def charger_modele():
                 break
         
         if not chemin_trouve:
-            st.error("Fichier modèle introuvable. Chemins essayés:")
-            for chemin in chemins_possibles:
-                st.write(f"- {chemin}")
+            st.error("Fichier modèle introuvable")
+            st.info("Veuillez vérifier que le fichier modèle est présent dans le dépôt")
             st.stop()
         
         modele = keras.models.load_model(chemin_trouve, compile=False)
-        st.sidebar.success(f"Modèle chargé: {chemin_trouve}")
         return modele
     except Exception as e:
         st.error(f"Erreur lors du chargement du modèle : {str(e)}")
@@ -65,329 +65,304 @@ def preparer_image(image_pil, taille=TAILLE_IMAGE):
     image_array = image_array / 255.0
     return image_array
 
-# FONCTION GRAD-CAM CORRIGÉE - Version simplifiée
-
-def make_gradcam_heatmap_simple(img_array, model, last_conv_layer_name, pred_index=None):
+def afficher_resultats(predictions):
     """
-    Version simplifiée de Grad-CAM qui évite les erreurs d'indexation.
-    Basée sur la documentation officielle de Keras.
+    Affiche les résultats de prédiction de manière professionnelle.
     """
-    try:
-        # Créer un modèle qui mappe l'image d'entrée aux activations de la dernière couche conv
-        grad_model = keras.models.Model(
-            inputs=model.inputs,
-            outputs=[model.get_layer(last_conv_layer_name).output, model.output]
-        )
-        
-        # Calculer le gradient de la classe prédite par rapport aux activations
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_array)
-            
-            if pred_index is None:
-                pred_index = tf.argmax(predictions[0])
-            
-            # CORRECTION IMPORTANTE: Ne pas utiliser d'indexation par tuple
-            # Extraire la valeur scalaire de la classe prédite
-            class_output = predictions[0][pred_index]
-        
-        # Calculer les gradients
-        grads = tape.gradient(class_output, conv_outputs)[0]
-        
-        # Calculer les gradients pondérés
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        
-        # Multiplier chaque canal par son gradient moyen
-        conv_outputs = conv_outputs[0]
-        heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
-        
-        # Appliquer ReLU et normaliser
-        heatmap = tf.maximum(heatmap, 0)
-        heatmap = heatmap / tf.reduce_max(heatmap)
-        
-        return heatmap.numpy(), predictions.numpy()
-        
-    except Exception as e:
-        st.error(f"Erreur Grad-CAM: {str(e)}")
-        import traceback
-        st.code(traceback.format_exc())
-        return None, None
-
-# VERSION ALTERNATIVE - Plus robuste
-def make_gradcam_heatmap_robuste(img_array, model, layer_name, pred_index=None):
-    """
-    Version alternative plus robuste pour Grad-CAM.
-    """
-    try:
-        # 1. Obtenir la couche
-        layer = model.get_layer(layer_name)
-        
-        # 2. Créer un modèle pour les sorties de cette couche
-        grad_model = keras.models.Model(
-            inputs=[model.inputs],
-            outputs=[layer.output, model.output]
-        )
-        
-        # 3. Enregistrer les opérations avec GradientTape
-        with tf.GradientTape() as tape:
-            layer_output, predictions = grad_model(img_array)
-            
-            # Déterminer l'index de la classe si non fourni
-            if pred_index is None:
-                pred_index = tf.argmax(predictions[0])
-            
-            # CORRECTION: Utiliser tf.gather pour éviter l'indexation par tuple
-            class_output = tf.gather(predictions[0], pred_index)
-        
-        # 4. Calculer les gradients
-        grads = tape.gradient(class_output, layer_output)
-        
-        if grads is None:
-            # Fallback: utiliser les activations moyennes
-            heatmap = tf.reduce_mean(layer_output[0], axis=-1)
-            return heatmap.numpy(), predictions.numpy()
-        
-        # 5. Pooling des gradients
-        grads = tf.reduce_mean(grads, axis=[0, 1, 2])
-        
-        # 6. Calculer la heatmap
-        layer_output = layer_output[0]
-        heatmap = tf.reduce_sum(layer_output * grads, axis=-1)
-        
-        # 7. ReLU et normalisation
-        heatmap = tf.maximum(heatmap, 0)
-        max_val = tf.reduce_max(heatmap)
-        
-        if max_val > 0:
-            heatmap = heatmap / max_val
-        
-        return heatmap.numpy(), predictions.numpy()
-        
-    except Exception as e:
-        st.error(f"Erreur dans la version robuste: {str(e)}")
-        return None, None
-
-# FONCTION POUR SUPERPOSER GRAD-CAM
-def superposer_gradcam_simple(img, heatmap, alpha=0.4):
-    """
-    Superpose la heatmap Grad-CAM sur l'image.
-    """
-    try:
-        # Redimensionner la heatmap pour correspondre à l'image
-        heatmap = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
-        
-        # Normaliser la heatmap entre 0 et 255
-        heatmap = np.uint8(255 * heatmap)
-        
-        # Appliquer la colormap
-        heatmap_colored = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-        
-        # Convertir l'image en BGR pour OpenCV
-        if len(img.shape) == 3 and img.shape[2] == 3:
-            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        else:
-            img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        
-        # Superposer
-        superimposed = cv2.addWeighted(img_bgr, 1 - alpha, heatmap_colored, alpha, 0)
-        
-        # Reconvertir en RGB pour l'affichage
-        superimposed = cv2.cvtColor(superimposed, cv2.COLOR_BGR2RGB)
-        
-        return Image.fromarray(superimposed)
-        
-    except Exception as e:
-        st.error(f"Erreur de superposition: {str(e)}")
-        return Image.fromarray(img)
-
-# FONCTIONS D'AFFICHAGE
-def afficher_predictions_detailees(predictions):
-    """
-    Affiche les probabilités de prédiction.
-    """
-    st.subheader("📊 Probabilités détaillées")
+    # Trouver la prédiction principale
+    idx_principal = np.argmax(predictions)
+    classe_principale = NOMS_CLASSES[idx_principal]
+    confiance_principale = predictions[idx_principal] * 100
     
+    # Créer deux colonnes pour l'affichage
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        # Afficher le diagnostic principal
+        st.markdown("### Diagnostic")
+        
+        # Déterminer la couleur en fonction de la confiance
+        if confiance_principale >= 90:
+            couleur = "#28a745"  # Vert
+            emoji = "✅"
+        elif confiance_principale >= 70:
+            couleur = "#ffc107"  # Jaune
+            emoji = "⚠️"
+        else:
+            couleur = "#dc3545"  # Rouge
+            emoji = "❓"
+        
+        st.markdown(f"""
+        <div style="border-left: 4px solid {couleur}; padding-left: 15px; margin: 10px 0;">
+            <h4 style="color: {couleur}; margin-bottom: 5px;">{classe_principale} {emoji}</h4>
+            <p style="font-size: 24px; font-weight: bold; color: {couleur};">
+                {confiance_principale:.1f}%
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        # Afficher la description de la classe
+        st.markdown("### Description")
+        st.info(DESCRIPTIONS_CLASSES[classe_principale])
+    
+    # Séparateur
+    st.divider()
+    
+    # Afficher toutes les probabilités
+    st.markdown("### Probabilités détaillées")
+    
+    # Créer un tableau pour les probabilités
     cols = st.columns(4)
+    
     for i, classe in enumerate(NOMS_CLASSES):
         proba = predictions[i] * 100
+        
         with cols[i]:
-            # Déterminer la couleur
-            if proba > 70:
-                color = "🟢"
-            elif proba > 30:
-                color = "🟡"
-            else:
-                color = "⚪"
-            
-            st.markdown(f"**{classe.capitalize()}** {color}")
-            st.progress(float(proba/100), text=f"{proba:.1f}%")
+            # Créer une barre de progression personnalisée
+            progress_html = f"""
+            <div style="margin-bottom: 15px;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 5px;">
+                    <span style="font-weight: bold;">{classe}</span>
+                    <span style="color: #6c757d;">{proba:.1f}%</span>
+                </div>
+                <div style="background: #e9ecef; height: 8px; border-radius: 4px; overflow: hidden;">
+                    <div style="background: {'#28a745' if i == idx_principal else '#007bff'}; 
+                         width: {proba}%; height: 100%;">
+                    </div>
+                </div>
+            </div>
+            """
+            st.markdown(progress_html, unsafe_allow_html=True)
+
+def afficher_guide_medical():
+    """
+    Affiche le guide médical dans la sidebar.
+    """
+    with st.sidebar.expander("Guide médical"):
+        st.markdown("""
+        **Classes diagnostiques :**
+        
+        **Glioma**
+        - Tumeur du tissu glial cérébral
+        - Peut être bénigne ou maligne
+        - Localisation variable dans le cerveau
+        
+        **Méningiome**
+        - Tumeur des méninges
+        - Généralement bénigne
+        - Croissance lente
+        
+        **Pas de tumeur**
+        - Absence de tumeur détectée
+        - Image normale ou pathologie non tumorale
+        
+        **Hypophyse**
+        - Tumeur de la glande hypophysaire
+        - Peut affecter la production hormonale
+        - Localisation : selle turcique
+        
+        **Note importante :**
+        Cette application fournit une analyse préliminaire.
+        Tout résultat doit être validé par un radiologue qualifié.
+        """)
 
 # APPLICATION PRINCIPALE
+
 def main():
     """
     Fonction principale de l'application.
     """
-    # Configuration
+    # Configuration de la page
     st.set_page_config(
-        page_title="Analyse d'IRM Cérébrales",
+        page_title="Système d'Analyse d'IRM Cérébrales",
         page_icon="🧠",
-        layout="wide"
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
     
-    st.title("🧠 Système d'Analyse d'IRM Cérébrales")
-    st.markdown("Classification automatique avec explication visuelle par Grad-CAM")
+    # CSS personnalisé
+    st.markdown("""
+    <style>
+    .main-header {
+        color: #2c3e50;
+        border-bottom: 2px solid #3498db;
+        padding-bottom: 10px;
+        margin-bottom: 30px;
+    }
+    .diagnostic-card {
+        background-color: #f8f9fa;
+        border-radius: 10px;
+        padding: 20px;
+        border-left: 5px solid #3498db;
+        margin: 20px 0;
+    }
+    .upload-section {
+        background-color: #e8f4f8;
+        padding: 20px;
+        border-radius: 10px;
+        margin: 20px 0;
+    }
+    .footer {
+        text-align: center;
+        color: #7f8c8d;
+        font-size: 12px;
+        margin-top: 50px;
+        padding-top: 20px;
+        border-top: 1px solid #ecf0f1;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # En-tête
+    st.markdown('<h1 class="main-header">Système d\'Analyse d\'IRM Cérébrales</h1>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="color: #34495e; font-size: 16px; margin-bottom: 30px;">
+    Application d'aide au diagnostic basée sur l'intelligence artificielle.
+    Classification automatique des images IRM cérébrales en quatre catégories.
+    </div>
+    """, unsafe_allow_html=True)
     
     # Sidebar
-    st.sidebar.header("⚙️ Paramètres")
+    st.sidebar.markdown("<h3 style='color: #2c3e50;'>Configuration</h3>", unsafe_allow_html=True)
     
     # Charger le modèle
-    model = charger_modele()
+    with st.sidebar:
+        with st.spinner("Chargement du modèle..."):
+            model = charger_modele()
+        st.success("Modèle chargé avec succès")
     
-    # Afficher les informations du modèle
-    with st.sidebar.expander("📋 Informations du modèle"):
-        st.write(f"**Nombre de couches:** {len(model.layers)}")
-        st.write("**Dernières couches:**")
-        for i, layer in enumerate(model.layers[-5:]):
-            st.write(f"- {layer.name} ({layer.__class__.__name__})")
+    # Informations techniques
+    with st.sidebar.expander("Informations techniques"):
+        st.write(f"**Résolution d'entrée :** {TAILLE_IMAGE[0]}x{TAILLE_IMAGE[1]} pixels")
+        st.write(f"**Architecture :** Réseau de neurones convolutif")
+        st.write(f"**Classes :** 4 catégories diagnostiques")
     
-    # Paramètre de transparence
-    alpha = st.sidebar.slider("Transparence Grad-CAM", 0.1, 0.8, 0.4, 0.1)
+    # Guide médical
+    afficher_guide_medical()
     
-    # Téléchargement d'image
-    st.header("📤 Téléchargement d'image")
+    # Section principale
+    st.markdown('<div class="upload-section">', unsafe_allow_html=True)
+    st.markdown("### Téléchargement d'image")
     
     uploaded_file = st.file_uploader(
-        "Choisissez une image IRM cérébrale",
-        type=["jpg", "jpeg", "png"]
+        "Sélectionnez une image IRM cérébrale",
+        type=["jpg", "jpeg", "png"],
+        help="Formats supportés : JPG, JPEG, PNG"
     )
+    st.markdown('</div>', unsafe_allow_html=True)
     
     if uploaded_file is not None:
         try:
             # Ouvrir l'image
             image = Image.open(uploaded_file).convert("RGB")
-            original_image = image.copy()
             
-            col1, col2 = st.columns(2)
+            # Créer deux colonnes pour l'affichage
+            col1, col2 = st.columns([1, 1])
             
             with col1:
-                st.subheader("🖼️ Image originale")
+                st.markdown("### Image originale")
                 st.image(image, use_container_width=True)
-                st.caption(f"Dimensions: {image.size}")
+                st.caption(f"Dimensions : {image.size[0]} x {image.size[1]} pixels")
             
             with col2:
-                st.subheader("🔍 Zone d'analyse")
+                st.markdown("### Analyse")
                 
-                if st.button("🚀 Lancer l'analyse complète", type="primary", use_container_width=True):
+                if st.button("Lancer l'analyse", type="primary", use_container_width=True):
                     with st.spinner("Analyse en cours..."):
                         # Préparer l'image
                         img_array = preparer_image(image)
                         
                         # Prédiction
                         predictions = model.predict(img_array, verbose=0)[0]
-                        pred_index = np.argmax(predictions)
-                        predicted_class = NOMS_CLASSES[pred_index]
-                        confidence = predictions[pred_index] * 100
                         
-                        # Afficher résultats
-                        st.success(f"**Diagnostic prédit: {predicted_class.capitalize()}**")
-                        st.info(f"**Confiance: {confidence:.1f}%**")
+                        # Afficher les résultats
+                        afficher_resultats(predictions)
                         
-                        # Essayer différentes méthodes pour Grad-CAM
-                        heatmap = None
-                        method_used = ""
+                        # Recommandations médicales
+                        st.markdown('<div class="diagnostic-card">', unsafe_allow_html=True)
+                        st.markdown("### Recommandations")
                         
-                        # Méthode 1: Version simple
-                        st.write("Tentative avec la méthode simple...")
-                        heatmap, _ = make_gradcam_heatmap_simple(
-                            img_array, model, NOM_DERNIERE_COUCHE_CONV, pred_index
-                        )
+                        idx_principal = np.argmax(predictions)
+                        classe_principale = NOMS_CLASSES[idx_principal]
                         
-                        if heatmap is not None:
-                            method_used = "méthode simple"
+                        if classe_principale == "Pas de tumeur":
+                            st.success("Aucune action immédiate requise. Suivi recommandé selon protocole standard.")
                         else:
-                            # Méthode 2: Version robuste
-                            st.write("Tentative avec la méthode robuste...")
-                            heatmap, _ = make_gradcam_heatmap_robuste(
-                                img_array, model, NOM_DERNIERE_COUCHE_CONV, pred_index
-                            )
-                            if heatmap is not None:
-                                method_used = "méthode robuste"
-                            else:
-                                # Méthode 3: Essayer d'autres couches
-                                st.write("Recherche d'une couche alternative...")
-                                for layer in model.layers:
-                                    if 'conv' in layer.name.lower() or layer.name != NOM_DERNIERE_COUCHE_CONV:
-                                        try:
-                                            heatmap, _ = make_gradcam_heatmap_simple(
-                                                img_array, model, layer.name, pred_index
-                                            )
-                                            if heatmap is not None:
-                                                method_used = f"couche alternative: {layer.name}"
-                                                break
-                                        except:
-                                            continue
+                            st.warning("""
+                            **Actions recommandées :**
+                            1. Consultation avec un neuro-radiologue
+                            2. Examens complémentaires si nécessaire
+                            3. Discussion en réunion de concertation pluridisciplinaire
+                            4. Planification du suivi
+                            """)
                         
-                        if heatmap is not None:
-                            # Préparer l'image pour superposition
-                            img_np = np.array(original_image.resize(TAILLE_IMAGE))
-                            
-                            # Superposer Grad-CAM
-                            superimposed_img = superposer_gradcam_simple(
-                                img_np, heatmap, alpha
-                            )
-                            
-                            # Afficher résultat
-                            st.image(
-                                superimposed_img,
-                                caption=f"Visualisation Grad-CAM ({method_used})",
-                                use_container_width=True
-                            )
-                            
-                            # Légende
-                            with st.expander("🎨 Légende des couleurs"):
-                                st.markdown("""
-                                - **🟥 Rouge vif**: Zones les plus importantes pour la décision
-                                - **🟨 Jaune/Orange**: Zones moyennement importantes
-                                - **🟦 Bleu**: Zones moins importantes
-                                
-                                *La chaleur de la couleur indique l'importance de la région pour la classification.*
-                                """)
-                            
-                            # Détails des prédictions
-                            afficher_predictions_detailees(predictions)
-                            
-                        else:
-                            st.warning("⚠️ Grad-CAM non disponible")
-                            st.info("Affichage des prédictions uniquement:")
-                            afficher_predictions_detailees(predictions)
-                            
-                            # Alternative: afficher juste l'image avec les prédictions
-                            st.subheader("📈 Prédictions")
-                            for i, classe in enumerate(NOMS_CLASSES):
-                                proba = predictions[i] * 100
-                                st.write(f"{classe.capitalize()}: {proba:.1f}%")
+                        st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Informations supplémentaires
+            with st.expander("Informations sur l'image"):
+                st.write(f"**Format :** {image.format if image.format else 'Inconnu'}")
+                st.write(f"**Mode :** {image.mode}")
+                st.write("**Note :** L'image a été redimensionnée à 224x224 pixels pour l'analyse")
         
         except Exception as e:
-            st.error(f"❌ Erreur: {str(e)}")
-            import traceback
-            st.code(traceback.format_exc())
+            st.error(f"Erreur lors du traitement de l'image : {str(e)}")
+            
+            # Afficher des informations de débogage
+            with st.expander("Détails de l'erreur"):
+                import traceback
+                st.code(traceback.format_exc())
     
     else:
-        # Mode démo
-        st.info("👆 Veuillez télécharger une image IRM pour commencer")
+        # Message d'accueil
+        st.markdown("""
+        <div style="background-color: #f0f8ff; padding: 30px; border-radius: 10px; text-align: center; margin-top: 30px;">
+            <h3 style="color: #2c3e50;">Bienvenue</h3>
+            <p style="color: #34495e; font-size: 16px;">
+                Téléchargez une image IRM cérébrale pour obtenir une analyse automatique.
+            </p>
+            <p style="color: #7f8c8d; font-size: 14px;">
+                L'application classifie les images en quatre catégories diagnostiques.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
         
-        with st.expander("ℹ️ Instructions"):
-            st.markdown("""
-            1. **Téléchargez** une image IRM cérébrale
-            2. **Cliquez** sur "Lancer l'analyse complète"
-            3. **Analysez** les résultats et visualisez les zones importantes
+        # Section d'exemple
+        with st.expander("Exemples de cas cliniques"):
+            col1, col2, col3, col4 = st.columns(4)
             
-            **Formats acceptés:** JPG, JPEG, PNG
-            """)
+            with col1:
+                st.markdown("**Glioma**")
+                st.image("https://via.placeholder.com/150/FF6B6B/FFFFFF?text=Glioma", 
+                        caption="Exemple de glioma", width=150)
+            
+            with col2:
+                st.markdown("**Méningiome**")
+                st.image("https://via.placeholder.com/150/4ECDC4/FFFFFF?text=Méningiome", 
+                        caption="Exemple de méningiome", width=150)
+            
+            with col3:
+                st.markdown("**Sain**")
+                st.image("https://via.placeholder.com/150/45B7D1/FFFFFF?text=Sain", 
+                        caption="IRM normale", width=150)
+            
+            with col4:
+                st.markdown("**Hypophyse**")
+                st.image("https://via.placeholder.com/150/96CEB4/FFFFFF?text=Hypophyse", 
+                        caption="Tumeur hypophysaire", width=150)
     
     # Pied de page
-    st.divider()
-    st.caption("🔬 Application de recherche - À utiliser comme outil d'aide au diagnostic")
-    st.caption("⚠️ Les résultats doivent être validés par un professionnel de santé")
+    st.markdown("""
+    <div class="footer">
+        <p>Application développée pour la recherche médicale</p>
+        <p>© 2025 - Système d'Aide au Diagnostic</p>
+        <p style="font-size: 11px;">
+            Cet outil est destiné aux professionnels de santé et ne remplace pas un diagnostic médical complet.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# POINT D'ENTRÉE
 
 if __name__ == "__main__":
     main()
