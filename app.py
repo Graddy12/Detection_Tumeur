@@ -10,6 +10,110 @@ from PIL import Image
 
 import os
 
+import hashlib
+
+import hmac
+
+
+
+# CONFIGURATION DE L'AUTHENTIFICATION
+
+# Les mots de passe hachés peuvent être définis via les variables d'environnement
+# APP_ADMIN_HASH et APP_MEDECIN_HASH. Par défaut, des valeurs de démonstration sont utilisées.
+# Pour générer un hachage : hashlib.sha256(b"votre_mot_de_passe").hexdigest()
+
+_HASH_ADMIN_PAR_DEFAUT = "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a"
+_HASH_MEDECIN_PAR_DEFAUT = "e7d2f9e5af4a1b2c3d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7"
+
+UTILISATEURS = {
+    "admin": os.environ.get("APP_ADMIN_HASH", _HASH_ADMIN_PAR_DEFAUT),
+    "medecin": os.environ.get("APP_MEDECIN_HASH", _HASH_MEDECIN_PAR_DEFAUT),
+}
+
+
+
+def verifier_mot_de_passe(nom_utilisateur, mot_de_passe):
+
+    """
+
+    Vérifie le nom d'utilisateur et le mot de passe en utilisant une comparaison
+    à temps constant pour prévenir les attaques temporelles.
+
+    """
+
+    hash_attendu = UTILISATEURS.get(nom_utilisateur)
+
+    if hash_attendu is None:
+
+        # Effectuer un hachage bidon pour éviter l'énumération de comptes par timing
+        hashlib.sha256(mot_de_passe.encode()).hexdigest()
+
+        return False
+
+    hash_fourni = hashlib.sha256(mot_de_passe.encode()).hexdigest()
+
+    return hmac.compare_digest(hash_attendu, hash_fourni)
+
+
+
+def afficher_page_connexion():
+
+    """
+
+    Affiche la page de connexion.
+
+    """
+
+    st.markdown("""
+
+    <style>
+
+    .login-container {
+
+        max-width: 400px;
+
+        margin: auto;
+
+        padding: 40px;
+
+        border-radius: 10px;
+
+        background-color: #f8f9fa;
+
+        border: 1px solid #dee2e6;
+
+    }
+
+    </style>
+
+    """, unsafe_allow_html=True)
+
+    st.markdown('<h1 style="text-align: center; color: #2c3e50;">🧠 Système d\'Analyse d\'IRM</h1>', unsafe_allow_html=True)
+
+    st.markdown('<h3 style="text-align: center; color: #7f8c8d; margin-bottom: 30px;">Connexion</h3>', unsafe_allow_html=True)
+
+    with st.form("formulaire_connexion"):
+
+        nom_utilisateur = st.text_input("Nom d'utilisateur", placeholder="Entrez votre nom d'utilisateur")
+
+        mot_de_passe = st.text_input("Mot de passe", type="password", placeholder="Entrez votre mot de passe")
+
+        soumettre = st.form_submit_button("Se connecter", use_container_width=True, type="primary")
+
+        if soumettre:
+
+            if verifier_mot_de_passe(nom_utilisateur, mot_de_passe):
+
+                st.session_state["connecte"] = True
+
+                st.session_state["utilisateur"] = nom_utilisateur
+
+                st.rerun()
+
+            else:
+
+                st.error("Identifiants invalides. Veuillez réessayer.")
+
 
 
 # CONFIGURATION DES CONSTANTES
@@ -338,7 +442,7 @@ def main():
 
     """
 
-    # Configuration de la page
+    # Configuration de la page (doit être appelée une seule fois, en premier)
 
     st.set_page_config(
 
@@ -351,6 +455,16 @@ def main():
         initial_sidebar_state="expanded"
 
     )
+
+    
+
+    # Vérification de l'authentification
+
+    if "connecte" not in st.session_state or not st.session_state["connecte"]:
+
+        afficher_page_connexion()
+
+        return
 
     
 
@@ -441,6 +555,16 @@ def main():
     # Sidebar
 
     st.sidebar.markdown("<h3 style='color: #2c3e50;'>Configuration</h3>", unsafe_allow_html=True)
+
+    st.sidebar.markdown(f"👤 Connecté en tant que **{st.session_state.get('utilisateur', '')}**")
+
+    if st.sidebar.button("Se déconnecter", use_container_width=True):
+
+        st.session_state.pop("connecte", None)
+
+        st.session_state.pop("utilisateur", None)
+
+        st.rerun()
 
     
 
